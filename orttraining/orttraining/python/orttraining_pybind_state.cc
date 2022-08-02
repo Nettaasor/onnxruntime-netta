@@ -26,6 +26,7 @@
 #include "orttraining/core/graph/gradient_definition_registry.h"
 #include "python/onnxruntime_pybind_mlvalue.h"
 #include "orttraining/python/orttraining_pybind_common.h"
+#include "orttraining/core/optimizer/graph_transformer_utils.h"
 
 #ifdef ENABLE_TRAINING_TORCH_INTEROP
 #include "orttraining/core/framework/torch/custom_function_register.h"
@@ -839,6 +840,50 @@ void addObjectMethodsForTraining(py::module& m, ExecutionProviderRegistrationFn 
 
           ORT_THROW_IF_ERROR(onnxruntime::training::api::SaveCheckpoint(trainable_tensor_protos,
                                                                         non_trainable_tensor_protos, checkpoint_path));
+        });
+
+  m.def("get_model_after_running_pre_training_graph_optimizations",
+        [](const py::bytes& serialized_model, const std::unordered_set<std::string>& graph_entities_that_require_gradients) {
+          std::istringstream buffer(serialized_model);
+          ONNX_NAMESPACE::ModelProto model_proto;
+          ORT_THROW_IF_ERROR(Model::Load(buffer, &model_proto));
+
+          auto logger_ptr = std::make_unique<logging::Logger>(logging::LoggingManager::DefaultLogger());
+          logger_ptr->SetSeverity(logging::Severity::kINFO);
+          std::shared_ptr<onnxruntime::Model> ort_model;
+          ORT_THROW_IF_ERROR(Model::Load(model_proto, ort_model, nullptr, *logger_ptr));
+
+          Graph& graph = ort_model->MainGraph();
+          ORT_THROW_IF_ERROR(graph.Resolve());
+
+          GraphTransformerManager graph_transformation_mgr{2};
+          std::unique_ptr<CPUExecutionProvider> cpu_execution_provider =
+              std::make_unique<CPUExecutionProvider>(CPUExecutionProviderInfo());
+
+          auto add_transformers = [&](TransformerLevel level) {
+            auto transformers_to_register = transformer_utils::GeneratePreTrainingTransformers(
+                level, graph_entities_that_require_gradients, TrainingGraphTransformerConfiguration(), *cpu_execution_provider);
+            for (auto& entry : transformers_to_register) {
+              ORT_THROW_IF_ERROR(graph_transformation_mgr.Register(std::move(entry), level));
+            }
+            return Status::OK();
+          };
+
+          for (int i = static_cast<int>(TransformerLevel::Level1); i <= static_cast<int>(TransformerLevel::MaxLevel); i++) {
+            TransformerLevel level = static_cast<TransformerLevel>(i);
+            if (TransformerLevel::MaxLevel >= level) {
+              ORT_THROW_IF_ERROR(add_transformers(level));
+            }
+          }
+
+          for (int i = static_cast<int>(TransformerLevel::Level1); i <= static_cast<int>(TransformerLevel::MaxLevel); i++) {
+            ORT_THROW_IF_ERROR(
+                graph_transformation_mgr.ApplyTransformers(graph, static_cast<TransformerLevel>(i), *logger_ptr));
+          }
+
+          std::string model_str;
+          ort_model->ToProto().SerializeToString(&model_str);
+          return model_str;
         });
 #endif
 }
